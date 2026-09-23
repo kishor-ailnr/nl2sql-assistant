@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+google-generativeai
+python-dotenv
+sqlalchemy
+sqlglot
+sentence-transformers
+faiss-cpu
+requests
+python-multipart

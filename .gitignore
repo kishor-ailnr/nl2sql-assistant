@@ -1,0 +1,9 @@
+﻿nl2sql-backend/venv/
+nl2sql-backend/__pycache__/
+nl2sql-backend/*.pyc
+nl2sql-backend/.env
+nl2sql-backend/data/*.db-shm
+nl2sql-backend/data/*.db-wal
+frontend/node_modules/
+frontend/dist/
+frontend/.env

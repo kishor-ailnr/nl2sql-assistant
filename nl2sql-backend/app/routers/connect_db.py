@@ -1,0 +1,288 @@
+import re
+import csv
+import io
+import sqlite3
+import uuid
+from typing import Optional
+from datetime import datetime
+from typing import List, Dict, Any, Literal
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.orm import Session
+
+from app.config import DATA_DIR
+from app.models.meta_db import SessionModel, get_db_session
+from app.services.session_store import set_session
+
+router = APIRouter()
+
+
+class ConnectDBRequest(BaseModel):
+    db_type: str = Field(
+        "demo", description="Database type, currently supporting 'demo'"
+    )
+    demo_name: Optional[str] = Field(
+        "hospital", description="Name of the demo database ('hospital' or 'ecommerce')"
+    )
+    connection_string: Optional[str] = Field(
+        None, description="Optional connection string"
+    )
+
+
+class ConnectDBResponse(BaseModel):
+    session_id: str
+    status: str
+    tables: List[str]
+
+
+_DEMO_SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def get_demo_schema(demo_name: str) -> Optional[Dict[str, Any]]:
+    """Retrieve demo database schema from in-memory cache, or load and cache it."""
+    if demo_name in _DEMO_SCHEMA_CACHE:
+        return _DEMO_SCHEMA_CACHE[demo_name]
+
+    db_filename = f"demo_{demo_name}.db"
+    db_path = DATA_DIR / db_filename
+    if not db_path.exists():
+        return None
+
+    demo_engine = create_engine(
+        f"sqlite:///{db_path.as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    inspector = inspect(demo_engine)
+    table_names = inspector.get_table_names()
+    schema_info: Dict[str, List[Dict[str, str]]] = {}
+    for table in table_names:
+        cols = inspector.get_columns(table)
+        schema_info[table] = [
+            {"name": col["name"], "type": str(col["type"])} for col in cols
+        ]
+
+    demo_data = {
+        "tables": table_names,
+        "schema": schema_info,
+        "db_path": db_path,
+        "database_url": f"sqlite:///{db_path.as_posix()}",
+    }
+    _DEMO_SCHEMA_CACHE[demo_name] = demo_data
+    return demo_data
+
+
+def preload_demo_cache() -> None:
+    """Pre-warm schema cache for all available demo databases."""
+    for demo_name in ["hospital", "ecommerce"]:
+        try:
+            get_demo_schema(demo_name)
+        except Exception:
+            pass
+
+
+@router.post("/connect-db", response_model=ConnectDBResponse)
+def connect_database(
+    payload: ConnectDBRequest,
+    db: Session = Depends(get_db_session),
+):
+    """Connect to a demo SQLite database, extract its schema, and initialize a session."""
+    demo_name = payload.demo_name or "hospital"
+    if demo_name not in ["hospital", "ecommerce"]:
+        demo_name = "hospital"
+
+    cached_demo = get_demo_schema(demo_name)
+    if not cached_demo:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Database file 'demo_{demo_name}.db' not found in data directory. Please ensure it is seeded.",
+        )
+
+    table_names = cached_demo["tables"]
+    schema_info = cached_demo["schema"]
+    db_path = cached_demo["db_path"]
+    database_url = cached_demo["database_url"]
+
+    # Generate session ID and register in meta database
+    session_id = str(uuid.uuid4())
+    session_record = SessionModel(
+        id=session_id,
+        db_type=f"demo_{demo_name}",
+        connected_at=datetime.utcnow(),
+    )
+    db.add(session_record)
+    db.commit()
+
+    # Store in memory session store
+    set_session(
+        session_id,
+        {
+            "db_type": payload.db_type,
+            "demo_name": demo_name,
+            "db_path": db_path,
+            "database_url": database_url,
+            "tables": table_names,
+            "schema": schema_info,
+        },
+    )
+
+    return ConnectDBResponse(
+        session_id=session_id,
+        status="connected",
+        tables=table_names,
+    )
+
+
+
+@router.post("/upload-db", response_model=ConnectDBResponse)
+async def upload_database(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db_session),
+):
+    """Upload a .csv or .sql file, import into a new session SQLite database, and return session."""
+    filename = file.filename or "uploaded_data"
+    lower_name = filename.lower()
+    if not (lower_name.endswith(".csv") or lower_name.endswith(".sql")):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format. Please upload a .csv or .sql file.",
+        )
+
+    session_id = str(uuid.uuid4())
+    db_filename = f"upload_{session_id}.db"
+    db_path = DATA_DIR / db_filename
+
+    content_bytes = await file.read()
+    if not content_bytes or len(content_bytes.strip()) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty.",
+        )
+
+    try:
+        sqlite_conn = sqlite3.connect(str(db_path))
+        cursor = sqlite_conn.cursor()
+
+        if lower_name.endswith(".sql"):
+            # Execute SQL script
+            try:
+                sql_text = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                sql_text = content_bytes.decode("latin-1")
+            cursor.executescript(sql_text)
+            sqlite_conn.commit()
+
+        elif lower_name.endswith(".csv"):
+            # Import CSV into SQLite table
+            try:
+                csv_text = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                csv_text = content_bytes.decode("latin-1")
+
+            csv_file = io.StringIO(csv_text)
+            reader = csv.reader(csv_file)
+            headers = next(reader, None)
+            if not headers:
+                sqlite_conn.close()
+                if db_path.exists():
+                    db_path.unlink()
+                raise HTTPException(
+                    status_code=400,
+                    detail="This file couldn't be read as a valid CSV/SQLite file (missing header row).",
+                )
+
+            # Sanitize table name
+            raw_table_name = re.sub(r"[^a-zA-Z0-9_]", "_", filename.rsplit(".", 1)[0]).strip("_")
+            table_name = raw_table_name if raw_table_name else "uploaded_data"
+
+            # Sanitize column names
+            clean_headers = []
+            for i, h in enumerate(headers):
+                c_name = re.sub(r"[^a-zA-Z0-9_]", "_", h.strip()).strip("_")
+                clean_headers.append(c_name if c_name else f"col_{i+1}")
+
+            col_defs = ", ".join([f'"{col}" TEXT' for col in clean_headers])
+            cursor.execute(f'CREATE TABLE "{table_name}" ({col_defs});')
+
+            placeholders = ", ".join(["?"] * len(clean_headers))
+            insert_sql = f'INSERT INTO "{table_name}" VALUES ({placeholders});'
+
+            rows_to_insert = []
+            for row in reader:
+                if len(row) < len(clean_headers):
+                    row.extend([""] * (len(clean_headers) - len(row)))
+                elif len(row) > len(clean_headers):
+                    row = row[: len(clean_headers)]
+                rows_to_insert.append(row)
+
+            if rows_to_insert:
+                cursor.executemany(insert_sql, rows_to_insert)
+            sqlite_conn.commit()
+
+        sqlite_conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if db_path.exists():
+            try:
+                db_path.unlink()
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=400,
+            detail=f"This file couldn't be read as a valid CSV/SQLite file: {str(exc)}",
+        )
+
+    # Inspect schema with SQLAlchemy
+    demo_engine = create_engine(
+        f"sqlite:///{db_path.as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+
+    inspector = inspect(demo_engine)
+    table_names = inspector.get_table_names()
+
+    if not table_names:
+        if db_path.exists():
+            db_path.unlink()
+        raise HTTPException(
+            status_code=400,
+            detail="This file couldn't be read as a valid CSV/SQLite file (no tables found).",
+        )
+
+    schema_info: Dict[str, List[Dict[str, str]]] = {}
+    for table in table_names:
+        cols = inspector.get_columns(table)
+        schema_info[table] = [
+            {"name": col["name"], "type": str(col["type"])} for col in cols
+        ]
+
+    # Save session record in meta database
+    session_record = SessionModel(
+        id=session_id,
+        db_type=f"upload_{session_id}",
+        connected_at=datetime.utcnow(),
+    )
+    db.add(session_record)
+    db.commit()
+
+    # Store in memory session store
+    set_session(
+        session_id,
+        {
+            "db_type": "upload",
+            "upload_name": filename,
+            "db_path": db_path,
+            "database_url": f"sqlite:///{db_path.as_posix()}",
+            "tables": table_names,
+            "schema": schema_info,
+        },
+    )
+
+    return ConnectDBResponse(
+        session_id=session_id,
+        status="connected",
+        tables=table_names,
+    )
+

@@ -1,0 +1,76 @@
+"""In-memory session store for connected database metadata and schema."""
+
+from typing import Any, Dict, Optional
+
+# Stores active sessions: session_id -> session_info_dict
+SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve session data by session_id, falling back to restoring demo sessions from meta.db if needed."""
+    session = SESSION_STORE.get(session_id)
+    if session:
+        return session
+
+    # Attempt to restore demo session from metadata database (e.g. after server reload)
+    try:
+        from app.models.meta_db import SessionLocal, SessionModel
+        from app.config import DATA_DIR
+        from sqlalchemy import create_engine, inspect
+
+        db = SessionLocal()
+        record = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+        db.close()
+
+        if record and record.db_type.startswith("demo_"):
+            demo_name = record.db_type.replace("demo_", "")
+            from app.routers.connect_db import get_demo_schema
+            cached = get_demo_schema(demo_name)
+            if cached:
+                restored = {
+                    "db_type": "demo",
+                    "demo_name": demo_name,
+                    "db_path": cached["db_path"],
+                    "database_url": cached["database_url"],
+                    "tables": cached["tables"],
+                    "schema": cached["schema"],
+                }
+                SESSION_STORE[session_id] = restored
+                return restored
+        elif record and record.db_type.startswith("upload_"):
+            db_path = DATA_DIR / f"{record.db_type}.db"
+            if db_path.exists():
+                demo_engine = create_engine(
+                    f"sqlite:///{db_path.as_posix()}",
+                    connect_args={"check_same_thread": False},
+                )
+                inspector = inspect(demo_engine)
+                table_names = inspector.get_table_names()
+                schema_info = {
+                    t: [{"name": col["name"], "type": str(col["type"])} for col in inspector.get_columns(t)]
+                    for t in table_names
+                }
+                restored = {
+                    "db_type": "upload",
+                    "upload_name": record.db_type,
+                    "db_path": db_path,
+                    "database_url": f"sqlite:///{db_path.as_posix()}",
+                    "tables": table_names,
+                    "schema": schema_info,
+                }
+                SESSION_STORE[session_id] = restored
+                return restored
+    except Exception:
+        pass
+
+    return None
+
+
+def set_session(session_id: str, data: Dict[str, Any]) -> None:
+    """Store session data for session_id."""
+    SESSION_STORE[session_id] = data
+
+
+def remove_session(session_id: str) -> None:
+    """Remove session data."""
+    SESSION_STORE.pop(session_id, None)
